@@ -3,7 +3,7 @@ import os
 import random
 import logging
 import aiosqlite
-import requests
+import aiohttp  # Заменяем requests на асинхронный клиент
 from datetime import datetime
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart, Command
@@ -20,15 +20,17 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
 from dotenv import load_dotenv
 
-
-
-
 load_dotenv()
 
-
 # Конфигурация
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
 DB_NAME = "finance.db"
+EXCHANGE_API_KEY = os.getenv("EXCHANGE_API_KEY")  # Безопасное хранение ключа
 
 bot = Bot(token=os.getenv("BOT_TOKEN"))
 dp = Dispatcher(storage=MemoryStorage())
@@ -43,7 +45,7 @@ def main_keyboard():
     builder.row(KeyboardButton(text="📊 Мои финансы"))
     builder.row(
         KeyboardButton(text="💱 Курс валют"),
-                KeyboardButton(text="💡 Советы"),
+        KeyboardButton(text="💡 Советы"),
     )
     builder.row(KeyboardButton(text="➕ Добавить операцию"))
     return builder.as_markup(resize_keyboard=True)
@@ -167,27 +169,72 @@ async def get_monthly_summary(user_id: int):
 
 
 # =============================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# =============================================
+
+async def send_transaction_confirmation(message: Message, data: dict):
+    """Универсальная функция для подтверждения транзакции"""
+    operation_type = "доход" if data["type"] == "income" else "расход"
+    await message.answer(
+        f"✅ {operation_type.capitalize()} в категории "
+        f"<b>{data['category']}</b> на сумму "
+        f"<b>{data['amount']:.2f} ₽</b> успешно добавлен!",
+        parse_mode="HTML",
+        reply_markup=main_keyboard()
+    )
+
+
+async def get_exchange_rates():
+    """Асинхронное получение курсов валют"""
+    url = f"https://v6.exchangerate-api.com/v6/{EXCHANGE_API_KEY}/latest/USD"
+
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url, timeout=10) as response:
+                if response.status != 200:
+                    logger.error(f"Ошибка API: {response.status}")
+                    return None
+
+                data = await response.json()
+
+                # Проверка успешности запроса
+                if data.get('result') != 'success':
+                    logger.error(f"Ошибка в ответе API: {data.get('error-type', 'unknown')}")
+                    return None
+
+                return data['conversion_rates']
+
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.error(f"Ошибка соединения: {str(e)}")
+            return None
+
+
+# =============================================
 # ОБРАБОТЧИКИ КОМАНД
 # =============================================
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    await register_user(
-        user_id=message.from_user.id,
-        full_name=message.from_user.full_name,
-        username=message.from_user.username
-    )
+    try:
+        await register_user(
+            user_id=message.from_user.id,
+            full_name=message.from_user.full_name,
+            username=message.from_user.username
+        )
 
-    await message.answer(
-        "💰 <b>Финансовый помощник</b>\n\n"
-        "Я помогу вам управлять личными финансами:\n"
-        "- 📊 Учет доходов и расходов\n"
-        "- 💡 Персональные советы по экономии\n"
-        "- 📈 Анализ финансовых привычек\n\n"
-        "Выберите действие:",
-        reply_markup=main_keyboard(),
-        parse_mode="HTML"
-    )
+        await message.answer(
+            "💰 <b>Финансовый помощник</b>\n\n"
+            "Я помогу вам управлять личными финансами:\n"
+            "- 📊 Учет доходов и расходов\n"
+            "- 💡 Персональные советы по экономии\n"
+            "- 📈 Анализ финансовых привычек\n\n"
+            "Выберите действие:",
+            reply_markup=main_keyboard(),
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"Ошибка в cmd_start: {str(e)}")
+        await message.answer("⚠️ Произошла ошибка при регистрации. Попробуйте позже.")
 
 
 @dp.message(Command("help"))
@@ -208,148 +255,171 @@ async def cmd_help(message: Message):
 
 @dp.message(F.text == "📊 Мои финансы")
 async def show_finances(message: Message):
-    user_id = message.from_user.id
-    balance = await get_user_balance(user_id)
+    try:
+        user_id = message.from_user.id
+        balance = await get_user_balance(user_id)
 
-    # Получаем статистику за месяц
-    summary = await get_monthly_summary(user_id)
+        # Получаем статистику за месяц
+        summary = await get_monthly_summary(user_id)
 
-    if not summary:
-        await message.answer(
-            f"💼 Ваш текущий баланс: <b>{balance:.2f} ₽</b>\n"
-            "У вас пока нет операций за этот месяц.",
-            parse_mode="HTML"
-        )
-        return
+        if not summary:
+            await message.answer(
+                f"💼 Ваш текущий баланс: <b>{balance:.2f} ₽</b>\n"
+                "У вас пока нет операций за этот месяц.",
+                parse_mode="HTML"
+            )
+            return
 
-    # Формируем отчет
-    income = 0
-    expenses = 0
-    report = ["<b>📈 Финансовый отчет за месяц:</b>", ""]
+        # Формируем отчет
+        income = 0
+        expenses = 0
+        report = ["<b>📈 Финансовый отчет за месяц:</b>", ""]
 
-    for row in summary:
-        trans_type, total, category = row
-        if trans_type == 'income':
-            income += total
-            report.append(f"⬆️ <b>{category}</b>: +{total:.2f} ₽")
-        else:
-            expenses += total
-            report.append(f"⬇️ <b>{category}</b>: -{total:.2f} ₽")
+        for row in summary:
+            trans_type, total, category = row
+            if trans_type == 'income':
+                income += total
+                report.append(f"⬆️ <b>{category}</b>: +{total:.2f} ₽")
+            else:
+                expenses += total
+                report.append(f"⬇️ <b>{category}</b>: -{total:.2f} ₽")
 
-    report.append("\n📊 <b>Итого:</b>")
-    report.append(f"Доходы: <b>+{income:.2f} ₽</b>")
-    report.append(f"Расходы: <b>-{expenses:.2f} ₽</b>")
-    report.append(f"Баланс: <b>{balance:.2f} ₽</b>")
+        report.append("\n📊 <b>Итого:</b>")
+        report.append(f"Доходы: <b>+{income:.2f} ₽</b>")
+        report.append(f"Расходы: <b>-{expenses:.2f} ₽</b>")
+        report.append(f"Баланс: <b>{balance:.2f} ₽</b>")
 
-    # Анализ расходов
-    if expenses > 0:
-        savings_percent = (income - expenses) / income * 100 if income > 0 else 0
-        report.append("\n💡 <b>Анализ:</b>")
-        report.append(f"Сбережения: <b>{savings_percent:.1f}%</b> от доходов")
+        # Анализ расходов
+        if expenses > 0:
+            savings_percent = (income - expenses) / income * 100 if income > 0 else 0
+            report.append("\n💡 <b>Анализ:</b>")
+            report.append(f"Сбережения: <b>{savings_percent:.1f}%</b> от доходов")
 
-        if savings_percent < 20:
-            report.append("Рекомендация: Попробуйте сократить расходы на развлечения и питание вне дома")
+            if savings_percent < 20:
+                report.append("Рекомендация: Попробуйте сократить расходы на развлечения и питание вне дома")
 
-    await message.answer("\n".join(report), parse_mode="HTML")
+        await message.answer("\n".join(report), parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Ошибка в show_finances: {str(e)}")
+        await message.answer("⚠️ Произошла ошибка при получении финансовых данных.")
 
 
 @dp.message(F.text == "💱 Курс валют")
 async def exchange_rates(message: Message):
-    rates = {
-        "USD": 75.50,
-        "EUR": 82.30,
-        "CNY": 10.45,
-        "GBP": 95.20
-    }
+    try:
+        rates = await get_exchange_rates()
 
-    response = ["<b>💱 Актуальные курсы:</b>",""]
-    for currency, rate in rates.items():
-        url = "https://v6.exchangerate-api.com/v6/09edf8b2bb246e1f801cbfba/latest/USD"
-        try:
-            response = requests.get(url)
-            data = response.json()
-            if response.status_code != 200:
-                await message.answer("Не удалось получить данные о курсе валют!")
-                return
-            usd_to_rub = data['conversion_rates']['RUB']
-            eur_to_usd = data['conversion_rates']['EUR']
-            cny_to_usd = data['conversion_rates']['CNY']
-            gbp_to_usd = data['conversion_rates']['GBP']
+        if not rates:
+            await message.answer("⚠️ Не удалось получить актуальные курсы валют. Попробуйте позже.")
+            return
 
-            euro_to_rub =  usd_to_rub / eur_to_usd
-            cny_to_rub = usd_to_rub / cny_to_usd
-            gbp_to_rub = usd_to_rub / gbp_to_usd
+        # Основные валюты
+        currencies = {
+            "USD": "🇺🇸 Доллар США",
+            "EUR": "🇪🇺 Евро",
+            "CNY": "🇨🇳 Китайский юань",
+            "GBP": "🇬🇧 Фунт стерлингов"
+        }
 
-            await message.answer(f"1 USD - {usd_to_rub:.2f}  RUB\n"
-                                 f"1 EUR - {euro_to_rub:.2f}  RUB\n" 
-                                 f"1 CNY - {cny_to_rub:.2f}  RUB\n"
-                                 f"1 GBP - {gbp_to_rub:.2f}  RUB"
-                                 )
+        response = ["<b>💱 Актуальные курсы к USD:</b>\n"]
 
-        except:
-            await message.answer("Произошла ошибка")
+        for code, name in currencies.items():
+            if code in rates:
+                rate = rates[code]
+                response.append(f"{name}: <b>{rate:.2f}</b>")
 
-        response.append(f"{currency}/RUB: <b>{rate:.2f}</b>")
+        # Рассчитываем курс рубля
+        if "RUB" in rates:
+            rub_rate = rates["RUB"]
+            response.append(f"\n🇷🇺 Российский рубль: <b>{rub_rate:.2f}</b>")
 
-    response.append("\n<i>Курсы обновляются ежедневно в 12:00 МСК</i>")
-    await message.answer("\n".join(response), parse_mode="HTML")
+            # Дополнительные расчеты
+            for code in ["EUR", "GBP", "CNY"]:
+                if code in rates:
+                    cross_rate = rub_rate / rates[code]
+                    response.append(f"{currencies[code]} в рублях: <b>{cross_rate:.2f}</b>")
+
+        response.append("\n<i>Курсы обновляются ежедневно в 12:00 МСК</i>")
+        await message.answer("\n".join(response), parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Ошибка в exchange_rates: {str(e)}")
+        await message.answer("⚠️ Произошла ошибка при получении курсов валют.")
 
 
 @dp.message(F.text == "💡 Советы")
 async def money_tips(message: Message):
     tips = [
-        "🔹 <b>Правило 50/30/20</b>\n 50% - основные расходы\n30% - желания\n20% - сбережения",
-        "🔹 <b>Автосбережения</b>\n Настройте автоматические переводы 10% от дохода на накопительный счет",
-        "🔹 <b>Анализ подписок</b>\n Отмените неиспользуемые подписки (стриминги, сервисы)",
-        "🔹 <b>Кэшбек</b>\n Используйте карты с кэшбеком для повседневных трат",
-        "🔹 <b>Планирование</b>\n Составляйте список покупок перед походом в магазин"
+        "🔹 <b>Правило 50/30/20</b>\n50% - основные расходы\n30% - желания\n20% - сбережения",
+        "🔹 <b>Автосбережения</b>\nНастройте автоматические переводы 10% от дохода на накопительный счет",
+        "🔹 <b>Анализ подписок</b>\nОтмените неиспользуемые подписки (стриминги, сервисы)",
+        "🔹 <b>Кэшбек</b>\nИспользуйте карты с кэшбеком для повседневных трат",
+        "🔹 <b>Планирование</b>\nСоставляйте список покупок перед походом в магазин",
+        "🔹 <b>Экономия на ЖКХ</b>\nУстановите счетчики воды и энергосберегающие лампы",
+        "🔹 <b>Правило 24 часов</b>\nПеред крупной покупкой выждите 24 часа"
     ]
 
-    await message.answer(
-        random.choice(tips),
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Ещё совет", callback_data="another_tip")]
-        ])
-    )
+    try:
+        await message.answer(
+            random.choice(tips),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Ещё совет", callback_data="another_tip")]
+            ])
+        )
+    except Exception as e:
+        logger.error(f"Ошибка в money_tips: {str(e)}")
+        await message.answer("💡 Совет: Всегда имейте финансовую подушку безопасности!")
 
 
 @dp.message(F.text == "➕ Добавить операцию")
 async def add_transaction_start(message: Message, state: FSMContext):
-    await state.set_state(AddTransaction.TYPE)
-    await message.answer(
-        "Выберите тип операции:",
-        reply_markup=transaction_type_keyboard()
-    )
+    try:
+        await state.set_state(AddTransaction.TYPE)
+        await message.answer(
+            "Выберите тип операции:",
+            reply_markup=transaction_type_keyboard()
+        )
+    except Exception as e:
+        logger.error(f"Ошибка в add_transaction_start: {str(e)}")
+        await message.answer("⚠️ Не удалось начать добавление операции. Попробуйте позже.")
 
 
 # =============================================
-# FSM: ДОБАВЛЕНИЕ ОПЕРАЦИИ
+# FSM: ДОБАВЛЕНИЕ ОПЕРАЦИИ (с обработкой ошибок)
 # =============================================
 
 @dp.message(AddTransaction.TYPE)
 async def process_type(message: Message, state: FSMContext):
-    if message.text not in ["📈 Доход", "📉 Расход"]:
-        await message.answer("Пожалуйста, выберите тип операции с клавиатуры")
-        return
+    try:
+        if message.text not in ["📈 Доход", "📉 Расход"]:
+            await message.answer("Пожалуйста, выберите тип операции с клавиатуры")
+            return
 
-    await state.update_data(
-        type="income" if message.text == "📈 Доход" else "expense"
-    )
-    await state.set_state(AddTransaction.CATEGORY)
-    await message.answer("Выберите категорию:", reply_markup=categories_keyboard())
+        await state.update_data(
+            type="income" if message.text == "📈 Доход" else "expense"
+        )
+        await state.set_state(AddTransaction.CATEGORY)
+        await message.answer("Выберите категорию:", reply_markup=categories_keyboard())
+    except Exception as e:
+        logger.error(f"Ошибка в process_type: {str(e)}")
+        await message.answer("⚠️ Ошибка при обработке типа операции.")
+        await state.clear()
 
 
 @dp.message(AddTransaction.CATEGORY)
 async def process_category(message: Message, state: FSMContext):
-    # Проверка пользовательских категорий
-    if message.text.startswith("/"):
-        await message.answer("Используйте клавиатуру для выбора категории")
-        return
+    try:
+        if message.text.startswith("/"):
+            await message.answer("Используйте клавиатуру для выбора категории")
+            return
 
-    await state.update_data(category=message.text)
-    await state.set_state(AddTransaction.AMOUNT)
-    await message.answer("Введите сумму:", reply_markup=types.ReplyKeyboardRemove())
+        await state.update_data(category=message.text)
+        await state.set_state(AddTransaction.AMOUNT)
+        await message.answer("Введите сумму:", reply_markup=types.ReplyKeyboardRemove())
+    except Exception as e:
+        logger.error(f"Ошибка в process_category: {str(e)}")
+        await message.answer("⚠️ Ошибка при обработке категории.")
+        await state.clear()
 
 
 @dp.message(AddTransaction.AMOUNT)
@@ -357,49 +427,55 @@ async def process_amount(message: Message, state: FSMContext):
     try:
         amount = float(message.text.replace(",", "."))
         if amount <= 0:
-            raise ValueError
+            await message.answer("Сумма должна быть больше нуля")
+            return
     except (ValueError, TypeError):
         await message.answer("Пожалуйста, введите корректную сумму (число больше 0)")
         return
+    except Exception as e:
+        logger.error(f"Ошибка в process_amount: {str(e)}")
+        await message.answer("⚠️ Ошибка при обработке суммы.")
+        await state.clear()
+        return
 
-    await state.update_data(amount=amount)
-    await state.set_state(AddTransaction.COMMENT)
-    await message.answer("Добавьте комментарий (или нажмите /skip):")
+    try:
+        await state.update_data(amount=amount)
+        await state.set_state(AddTransaction.COMMENT)
+        await message.answer("Добавьте комментарий (или нажмите /skip):")
+    except Exception as e:
+        logger.error(f"Ошибка в process_amount (update): {str(e)}")
+        await message.answer("⚠️ Ошибка при обработке суммы.")
+        await state.clear()
 
 
 @dp.message(AddTransaction.COMMENT)
 async def process_comment(message: Message, state: FSMContext):
-    data = await state.get_data()
-    data["comment"] = message.text
+    try:
+        data = await state.get_data()
+        data["comment"] = message.text
 
-    await add_transaction(message.from_user.id, data)
-    await state.clear()
-
-    operation_type = "доход" if data["type"] == "income" else "расход"
-    await message.answer(
-        f"✅ {operation_type.capitalize()} в категории "
-        f"<b>{data['category']}</b> на сумму "
-        f"<b>{data['amount']:.2f} ₽</b> успешно добавлен!",
-        parse_mode="HTML",
-        reply_markup=main_keyboard()
-    )
+        await add_transaction(message.from_user.id, data)
+        await state.clear()
+        await send_transaction_confirmation(message, data)
+    except Exception as e:
+        logger.error(f"Ошибка в process_comment: {str(e)}")
+        await message.answer("⚠️ Не удалось добавить операцию. Попробуйте снова.")
+        await state.clear()
 
 
 # Пропуск комментария
 @dp.message(Command("skip"), AddTransaction.COMMENT)
 async def skip_comment(message: Message, state: FSMContext):
-    data = await state.get_data()
-    await state.clear()
+    try:
+        data = await state.get_data()
+        await state.clear()
 
-    await add_transaction(message.from_user.id, data)
-    operation_type = "доход" if data["type"] == "income" else "расход"
-    await message.answer(
-        f"✅ {operation_type.capitalize()} в категории "
-        f"<b>{data['category']}</b> на сумму "
-        f"<b>{data['amount']:.2f} ₽</b> успешно добавлен!",
-        parse_mode="HTML",
-        reply_markup=main_keyboard()
-    )
+        await add_transaction(message.from_user.id, data)
+        await send_transaction_confirmation(message, data)
+    except Exception as e:
+        logger.error(f"Ошибка в skip_comment: {str(e)}")
+        await message.answer("⚠️ Не удалось добавить операцию. Попробуйте снова.")
+        await state.clear()
 
 
 # =============================================
@@ -408,8 +484,14 @@ async def skip_comment(message: Message, state: FSMContext):
 
 async def main():
     await init_db()
+    logger.info("Бот запущен")
     await dp.start_polling(bot)
 
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Бот остановлен")
+    except Exception as e:
+        logger.critical(f"Критическая ошибка: {str(e)}")
